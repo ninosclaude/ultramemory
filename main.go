@@ -32,6 +32,7 @@ import (
 	"github.com/sharpner/ultramemory/graph"
 	"github.com/sharpner/ultramemory/ingest"
 	"github.com/sharpner/ultramemory/llm"
+	"github.com/sharpner/ultramemory/secureindex"
 	"github.com/sharpner/ultramemory/store"
 )
 
@@ -43,6 +44,7 @@ const (
 	defaultDB    = "memory-local.db"
 	defaultGroup = "default"
 	pollInterval = 200 * time.Millisecond
+	secureMethod = "bregman-v1"
 )
 
 func main() {
@@ -154,6 +156,92 @@ func main() {
 		results, err := graph.Search(ctx, db, runtimeProfile.embedder, query, groupID, 10)
 		must(err, "search")
 		printSearch(results, query, *format, *maxTokens)
+
+	case "personal-index":
+		fs := flag.NewFlagSet("personal-index", flag.ExitOnError)
+		methodName := fs.String("method", secureMethod, "secure index method name")
+		key := fs.String("key", "", "personal key (fallback: MEMORY_PERSONAL_KEY)")
+		_ = fs.Parse(os.Args[2:])
+		secureKey := secureKeyOrEnv(*key)
+		if secureKey == "" {
+			fatalf("usage: ultramemory personal-index [-method %s] -key <secret>", secureMethod)
+		}
+		episodes, err := db.AllEpisodesWithEmbeddings(ctx, groupID)
+		must(err, "load episodes")
+		if len(episodes) == 0 {
+			fatalf("no episodes with embeddings found in group %q; run ingest/worker first", groupID)
+		}
+		method := secureindex.NewMethod(secureKey, len(episodes[0].Embedding))
+		rows := make([]store.SecureEpisodeIndexRow, 0, len(episodes))
+		for _, episode := range episodes {
+			state := method.EncodeDoc(episode.Embedding)
+			rows = append(rows, store.SecureEpisodeIndexRow{
+				EpisodeUUID: episode.UUID,
+				GroupID:     groupID,
+				Method:      *methodName,
+				Public:      state.Public,
+				Base:        state.Base,
+				WaveReal:    state.WaveReal,
+				WaveImag:    state.WaveImag,
+				ModeWeight:  state.ModeWeight,
+				ModeEnergy:  state.ModeEnergy,
+				KeyProbe:    state.KeyProbe,
+			})
+		}
+		must(db.ReplaceSecureEpisodeIndex(ctx, groupID, *methodName, rows), "store secure index")
+		fmt.Fprintf(os.Stderr, "✓ Built %s secure episode index for %d episodes in group %q\n", *methodName, len(rows), groupID)
+
+	case "personal-search":
+		fs := flag.NewFlagSet("personal-search", flag.ExitOnError)
+		methodName := fs.String("method", secureMethod, "secure index method name")
+		key := fs.String("key", "", "personal key (fallback: MEMORY_PERSONAL_KEY)")
+		format := fs.String("format", "text", "output format: text|json")
+		limit := fs.Int("limit", 10, "maximum number of hits")
+		_ = fs.Parse(os.Args[2:])
+		if fs.NArg() < 1 {
+			fatalf("usage: ultramemory personal-search [-method %s] [-limit N] -key <secret> <query>", secureMethod)
+		}
+		secureKey := secureKeyOrEnv(*key)
+		if secureKey == "" {
+			fatalf("usage: ultramemory personal-search [-method %s] [-limit N] -key <secret> <query>", secureMethod)
+		}
+		rows, err := db.AllSecureEpisodes(ctx, groupID, *methodName)
+		must(err, "load secure index")
+		if len(rows) == 0 {
+			fatalf("no secure episode index found for group %q and method %q; run ultramemory personal-index first", groupID, *methodName)
+		}
+		must(runtimeProfile.ping(ctx), "ping runtime")
+		query := strings.Join(fs.Args(), " ")
+		queryEmb, err := runtimeProfile.embedder.Embed(ctx, query)
+		must(err, "embed query")
+		method := secureindex.NewMethod(secureKey, len(queryEmb))
+		queryState := method.EncodeQuery(queryEmb)
+		docs := secureStates(rows)
+		hits := method.Search(docs, queryState, *limit)
+		printPersonalSearch(rows, hits, query, *format)
+
+	case "personal-cluster":
+		fs := flag.NewFlagSet("personal-cluster", flag.ExitOnError)
+		methodName := fs.String("method", secureMethod, "secure index method name")
+		key := fs.String("key", "", "personal key (fallback: MEMORY_PERSONAL_KEY)")
+		format := fs.String("format", "text", "output format: text|json")
+		k := fs.Int("k", 10, "neighbors per episode in the keyed similarity graph")
+		minMembers := fs.Int("min", 2, "minimum members per cluster")
+		minScore := fs.Float64("min-score", 0.45, "minimum keyed edge score to keep")
+		resolution := fs.Float64("resolution", 1.0, "Louvain resolution")
+		_ = fs.Parse(os.Args[2:])
+		secureKey := secureKeyOrEnv(*key)
+		if secureKey == "" {
+			fatalf("usage: ultramemory personal-cluster [-method %s] [-k N] -key <secret>", secureMethod)
+		}
+		rows, err := db.AllSecureEpisodes(ctx, groupID, *methodName)
+		must(err, "load secure index")
+		if len(rows) == 0 {
+			fatalf("no secure episode index found for group %q and method %q; run ultramemory personal-index first", groupID, *methodName)
+		}
+		method := secureindex.NewMethod(secureKey, len(rows[0].Base))
+		clusters := method.Cluster(secureStates(rows), *k, *resolution, *minScore)
+		printPersonalClusters(rows, clusters, *format, *minMembers)
 
 	case "bench":
 		fs := flag.NewFlagSet("bench", flag.ExitOnError)
@@ -409,6 +497,20 @@ type searchHit struct {
 	Source string  `json:"source,omitempty"`
 }
 
+type personalSearchHit struct {
+	Rank    int     `json:"rank"`
+	UUID    string  `json:"uuid"`
+	Score   float64 `json:"score"`
+	Source  string  `json:"source,omitempty"`
+	Content string  `json:"content"`
+}
+
+type personalClusterHit struct {
+	ClusterID int      `json:"cluster_id"`
+	Size      int      `json:"size"`
+	Members   []string `json:"members"`
+}
+
 // approxTokens estimates token count using the standard 1 token ≈ 4 chars heuristic.
 func approxTokens(s string) int {
 	return (len(s) + 3) / 4
@@ -448,6 +550,74 @@ func printSearch(results []graph.SearchResult, query, format string, maxTokens i
 		fmt.Printf("%d. [%s] %s\n   %s\n   score=%.4f\n%s\n",
 			i+1, r.Type, r.Title, r.Body, r.Score, src)
 		used += cost
+	}
+}
+
+func printPersonalSearch(rows []store.SecureEpisodeIndexRow, hits []secureindex.SearchHit, query, format string) {
+	if format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		for rank, hit := range hits {
+			row := rows[hit.Index]
+			_ = enc.Encode(personalSearchHit{
+				Rank:    rank + 1,
+				UUID:    row.EpisodeUUID,
+				Score:   hit.Score,
+				Source:  row.Source,
+				Content: row.Content,
+			})
+		}
+		return
+	}
+	if len(hits) == 0 {
+		fmt.Println("(no secure results)")
+		return
+	}
+	fmt.Printf("Secure results for %q:\n\n", query)
+	for rank, hit := range hits {
+		row := rows[hit.Index]
+		fmt.Printf("%d. [%0.4f] %s\n   %s\n\n", rank+1, hit.Score, filepath.Base(row.Source), truncateLine(row.Content, 180))
+	}
+}
+
+func printPersonalClusters(rows []store.SecureEpisodeIndexRow, clusters []secureindex.Cluster, format string, minMembers int) {
+	filtered := clusters[:0]
+	for _, cluster := range clusters {
+		if len(cluster.Members) < minMembers {
+			continue
+		}
+		filtered = append(filtered, cluster)
+	}
+
+	if format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		for _, cluster := range filtered {
+			members := make([]string, 0, len(cluster.Members))
+			for _, member := range cluster.Members {
+				row := rows[member]
+				members = append(members, truncateLine(row.Content, 120))
+			}
+			_ = enc.Encode(personalClusterHit{
+				ClusterID: cluster.ID,
+				Size:      len(cluster.Members),
+				Members:   members,
+			})
+		}
+		return
+	}
+
+	if len(filtered) == 0 {
+		fmt.Printf("(no personal clusters with >= %d members)\n", minMembers)
+		return
+	}
+
+	fmt.Printf("── Personal Secure Clusters (%d shown) ────────\n\n", len(filtered))
+	for _, cluster := range filtered {
+		fmt.Printf("  Cluster %d (%d members)\n", cluster.ID, len(cluster.Members))
+		for _, member := range cluster.Members {
+			row := rows[member]
+			fmt.Printf("    - %s\n", truncateLine(row.Content, 120))
+		}
+		fmt.Println()
 	}
 }
 
@@ -573,6 +743,9 @@ func usage() {
   ingest  <path>   queue all text files for processing         [-source URL]
   worker           process queued jobs (blocking)
   search  <query>  hybrid search over the graph (flags: -format text|json, -max-tokens N)
+  personal-index   build keyed episode index from existing episode embeddings (-key, -method)
+  personal-search  keyed search over episodes                                 (-key, -method, -limit, -format)
+  personal-cluster keyed clustering over episode semantics                    (-key, -method, -k, -min-score)
   retry            requeue all failed jobs for reprocessing
   resolve          merge near-duplicate entities (flags: -dry-run, -threshold 0.85)
   communities      detect + list communities                     (flags: -detect, -ricci, -format, -resolution)
@@ -583,6 +756,7 @@ func usage() {
 Environment:
   MEMORY_DB                  path to SQLite file          (default: memory-local.db)
   MEMORY_GROUP               namespace/group              (default: default)
+  MEMORY_PERSONAL_KEY        keyed episode search/cluster secret
   MEMORY_RESOLVE_THRESHOLD   resolve similarity           (default: 0.92)
   MEMORY_LLM_PARALLEL        concurrent LLM calls         (default: %d)
 %s`, defaultLLMParallel, buildEnvironmentHelp)
@@ -593,6 +767,13 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func secureKeyOrEnv(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return os.Getenv("MEMORY_PERSONAL_KEY")
 }
 
 func mustNewMistralClient(model, usage string) *llm.MistralClient {
@@ -607,6 +788,33 @@ func must(err error, msg string) {
 	if err != nil {
 		fatalf("%s: %v", msg, err)
 	}
+}
+
+func secureStates(rows []store.SecureEpisodeIndexRow) []secureindex.State {
+	states := make([]secureindex.State, 0, len(rows))
+	for _, row := range rows {
+		states = append(states, secureindex.State{
+			Public:     row.Public,
+			Base:       row.Base,
+			WaveReal:   row.WaveReal,
+			WaveImag:   row.WaveImag,
+			ModeWeight: row.ModeWeight,
+			ModeEnergy: row.ModeEnergy,
+			KeyProbe:   row.KeyProbe,
+		})
+	}
+	return states
+}
+
+func truncateLine(value string, max int) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\n", " "))
+	if len(value) <= max {
+		return value
+	}
+	if max <= 3 {
+		return value[:max]
+	}
+	return value[:max-3] + "..."
 }
 
 func recoverStaleJobs(ctx context.Context, db *store.DB) {

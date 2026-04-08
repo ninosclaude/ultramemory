@@ -87,6 +87,15 @@ ultramemory search "Alice Schmidt TechCorp"
 ultramemory search -max-tokens 200 "Alice Schmidt TechCorp"
 ultramemory search -format json -max-tokens 500 "Alice Schmidt TechCorp"
 
+# Build an experimental keyed episode index from existing episode embeddings
+MEMORY_PERSONAL_KEY=secret ultramemory personal-index
+
+# Search episodes in the keyed semantic space
+MEMORY_PERSONAL_KEY=secret ultramemory personal-search "documents about cats"
+
+# Cluster episodes in the authorized keyed space
+MEMORY_PERSONAL_KEY=secret ultramemory personal-cluster
+
 # List detected communities
 ultramemory communities
 ultramemory communities -format json
@@ -103,6 +112,7 @@ ultramemory status
 |----------|---------|-------------|
 | `MEMORY_DB` | `memory-local.db` | SQLite database path |
 | `MEMORY_GROUP` | `default` | Namespace for graph isolation |
+| `MEMORY_PERSONAL_KEY` | unset | Key for experimental personal episode search/clustering |
 | `MEMORY_RESOLVE_THRESHOLD` | `0.92` | Cosine similarity threshold for entity deduplication (0–1) |
 | `MEMORY_LLM_PARALLEL` | build-dependent | Concurrent extraction calls |
 
@@ -196,6 +206,16 @@ ultramemory status -format json
 2. **Extract**: the active build profile extracts named entities and relationships from each chunk
 3. **Embed**: the active embedding backend generates vectors for semantic search
 4. **Search**: Hybrid FTS5 + cosine similarity fused via RRF, then extended by MAGMA graph traversal
+
+### Experimental personal secure index
+
+The repository now also includes an experimental keyed episode layer for personal memory workflows:
+
+- `personal-index` builds a `bregman-v1` secure episode index from existing episode embeddings
+- `personal-search` scores queries directly in the keyed semantic space
+- `personal-cluster` builds communities over keyed episode similarity rather than the extracted entity graph
+
+This path is intentionally separate from the graph pipeline. The existing graph search and community detection continue to work as before; the personal secure index is an opt-in layer for "search/clustering only with the right key" experiments.
 
 ### Search pipeline detail
 

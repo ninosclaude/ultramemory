@@ -124,6 +124,25 @@ CREATE TABLE IF NOT EXISTS community_reports (
 	report       TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (community_id, group_id)
 );
+
+CREATE TABLE IF NOT EXISTS secure_episode_index (
+	episode_uuid  TEXT NOT NULL,
+	group_id      TEXT NOT NULL,
+	method        TEXT NOT NULL,
+	public_layer  BLOB NOT NULL,
+	base_vec      BLOB NOT NULL,
+	wave_real     BLOB NOT NULL,
+	wave_imag     BLOB NOT NULL,
+	mode_weight   BLOB NOT NULL,
+	mode_energy   BLOB NOT NULL,
+	key_probe     BLOB NOT NULL,
+	created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (episode_uuid, group_id, method),
+	FOREIGN KEY (episode_uuid) REFERENCES episodes(uuid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_secure_episode_index_group
+	ON secure_episode_index(group_id, method);
 `
 
 // migrations runs after schema init to add columns to existing databases.
@@ -147,6 +166,22 @@ CREATE TABLE IF NOT EXISTS mutual_knn_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_mknn_group ON mutual_knn_edges(group_id);
 ALTER TABLE jobs ADD COLUMN not_before DATETIME;
+CREATE TABLE IF NOT EXISTS secure_episode_index (
+	episode_uuid  TEXT NOT NULL,
+	group_id      TEXT NOT NULL,
+	method        TEXT NOT NULL,
+	public_layer  BLOB NOT NULL,
+	base_vec      BLOB NOT NULL,
+	wave_real     BLOB NOT NULL,
+	wave_imag     BLOB NOT NULL,
+	mode_weight   BLOB NOT NULL,
+	mode_energy   BLOB NOT NULL,
+	key_probe     BLOB NOT NULL,
+	created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (episode_uuid, group_id, method)
+);
+CREATE INDEX IF NOT EXISTS idx_secure_episode_index_group ON secure_episode_index(group_id, method);
+ALTER TABLE secure_episode_index ADD COLUMN key_probe BLOB;
 `
 
 // DB wraps a SQLite database connection.
