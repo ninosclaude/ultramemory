@@ -15,7 +15,7 @@ func TestProcess_EntityCreated(t *testing.T) {
 		entityJSON("Jonathan Harker", "Count Dracula"),
 		edgeJSON("TRAVELS_TO", "Harker travels to Transylvania"),
 	)
-	ext := New(db, client, client, 0.5, 1)
+	ext := New(db, client, client, 0.5, 1, "")
 
 	if err := ext.Process(ctx, "Jonathan Harker travels to meet Count Dracula.", "test.txt", "g"); err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestProcess_EdgeCreated(t *testing.T) {
 		entityJSON("Jonathan Harker", "Count Dracula"),
 		edgeJSON("TRAVELS_TO", "Harker travels to Transylvania"),
 	)
-	ext := New(db, client, client, 0.5, 1)
+	ext := New(db, client, client, 0.5, 1, "")
 
 	if err := ext.Process(ctx, "Jonathan Harker travels to meet Count Dracula.", "test.txt", "g"); err != nil {
 		t.Fatal(err)
@@ -61,7 +61,7 @@ func TestProcess_EpisodeLinked(t *testing.T) {
 		entityJSON("Jonathan Harker"),
 		`{"edges":[]}`,
 	)
-	ext := New(db, client, client, 0.5, 1)
+	ext := New(db, client, client, 0.5, 1, "")
 
 	if err := ext.Process(ctx, "Jonathan Harker arrived at the castle.", "castle.txt", "g"); err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestProcess_ExactNameDedup(t *testing.T) {
 	ctx := context.Background()
 
 	client := newMockClient(t, entityJSON("Jonathan Harker"), `{"edges":[]}`)
-	ext := New(db, client, client, 0.5, 1)
+	ext := New(db, client, client, 0.5, 1, "")
 
 	if err := ext.Process(ctx, "Jonathan Harker arrived.", "a.txt", "g"); err != nil {
 		t.Fatal(err)
@@ -90,7 +90,7 @@ func TestProcess_ExactNameDedup(t *testing.T) {
 	ext.Wait()
 
 	client2 := newMockClient(t, entityJSON("JONATHAN HARKER"), `{"edges":[]}`)
-	ext2 := New(db, client2, client2, 0.5, 1)
+	ext2 := New(db, client2, client2, 0.5, 1, "")
 
 	if err := ext2.Process(ctx, "JONATHAN HARKER left.", "b.txt", "g"); err != nil {
 		t.Fatal(err)
@@ -107,7 +107,7 @@ func TestProcess_SourcePopulated(t *testing.T) {
 	db := openExtractTestDB(t)
 	ctx := context.Background()
 	client := newMockClient(t, entityJSON("Jonathan Harker"), `{"edges":[]}`)
-	ext := New(db, client, client, 0.5, 1)
+	ext := New(db, client, client, 0.5, 1, "")
 
 	if err := ext.Process(ctx, "Jonathan Harker arrived.", "dracula/chapter1.txt", "g"); err != nil {
 		t.Fatal(err)

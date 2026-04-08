@@ -25,6 +25,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -93,6 +95,7 @@ func main() {
 	runtimeProfile, err := newDefaultRuntime(extractModel, embedModel)
 	must(err, "configure runtime")
 	slog.Info("runtime configured", "provider", buildProviderName, "extract_model", extractModel, "embed_model", embedModel)
+	personalKey := secureKeyOrEnv("")
 
 	switch os.Args[1] {
 	case "ingest":
@@ -104,7 +107,7 @@ func main() {
 		}
 		rejectTrailingFlags(fs)
 		must(runtimeProfile.ping(ctx), "ping runtime")
-		w := ingest.New(db, groupID).WithOCR(runtimeProfile.ocr)
+		w := ingest.New(db, groupID).WithOCR(runtimeProfile.ocr).WithPersonalKey(personalKey)
 		if *source != "" {
 			w = w.WithSource(*source)
 		}
@@ -118,7 +121,7 @@ func main() {
 		if err := runtimeProfile.warmup(ctx); err != nil {
 			slog.Warn("warmup failed", "err", err)
 		}
-		runWorker(ctx, db, runtimeProfile.extractor, runtimeProfile.embedder, resolveThreshold, llmParallel, groupID)
+		runWorker(ctx, db, runtimeProfile.extractor, runtimeProfile.embedder, resolveThreshold, llmParallel, groupID, personalKey)
 
 	case "run":
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
@@ -134,14 +137,14 @@ func main() {
 			slog.Warn("warmup failed", "err", err)
 		}
 
-		w := ingest.New(db, groupID).WithOCR(runtimeProfile.ocr)
+		w := ingest.New(db, groupID).WithOCR(runtimeProfile.ocr).WithPersonalKey(personalKey)
 		if *source != "" {
 			w = w.WithSource(*source)
 		}
 		n, err := w.Walk(ctx, fs.Arg(0))
 		must(err, "walk")
 		fmt.Fprintf(os.Stderr, "✓ Queued %d chunks — starting worker (Ctrl+C to stop)\n", n)
-		runWorker(ctx, db, runtimeProfile.extractor, runtimeProfile.embedder, resolveThreshold, llmParallel, groupID)
+		runWorker(ctx, db, runtimeProfile.extractor, runtimeProfile.embedder, resolveThreshold, llmParallel, groupID, personalKey)
 
 	case "search":
 		fs := flag.NewFlagSet("search", flag.ExitOnError)
@@ -153,6 +156,12 @@ func main() {
 		}
 		must(runtimeProfile.ping(ctx), "ping runtime")
 		query := strings.Join(fs.Args(), " ")
+		if personalKey != "" {
+			results, err := graph.SecureSearch(ctx, db, runtimeProfile.embedder, personalKey, groupID, secureMethod, query, 10)
+			must(err, "secure search")
+			printSearch(results, query, *format, *maxTokens)
+			break
+		}
 		results, err := graph.Search(ctx, db, runtimeProfile.embedder, query, groupID, 10)
 		must(err, "search")
 		printSearch(results, query, *format, *maxTokens)
@@ -165,6 +174,12 @@ func main() {
 		secureKey := secureKeyOrEnv(*key)
 		if secureKey == "" {
 			fatalf("usage: ultramemory personal-index [-method %s] -key <secret>", secureMethod)
+		}
+		existing, err := db.CountSecureEpisodes(ctx, groupID, *methodName)
+		must(err, "count secure index")
+		if existing > 0 {
+			fmt.Fprintf(os.Stderr, "✓ Secure episode index already present for %d episodes in group %q\n", existing, groupID)
+			break
 		}
 		episodes, err := db.AllEpisodesWithEmbeddings(ctx, groupID)
 		must(err, "load episodes")
@@ -216,9 +231,11 @@ func main() {
 		must(err, "embed query")
 		method := secureindex.NewMethod(secureKey, len(queryEmb))
 		queryState := method.EncodeQuery(queryEmb)
+		rows, err = decryptSecureRows(rows, secureKey)
+		must(err, "decrypt secure rows")
 		docs := secureStates(rows)
 		hits := method.Search(docs, queryState, *limit)
-		printPersonalSearch(rows, hits, query, *format)
+		printPersonalSearch(rows, hits, query, *format, 0)
 
 	case "personal-cluster":
 		fs := flag.NewFlagSet("personal-cluster", flag.ExitOnError)
@@ -241,18 +258,21 @@ func main() {
 		}
 		method := secureindex.NewMethod(secureKey, len(rows[0].BaseWaveReal))
 		clusters := method.Cluster(secureStates(rows), *k, *resolution, *minScore)
+		rows, err = decryptSecureRows(rows, secureKey)
+		must(err, "decrypt secure rows")
 		printPersonalClusters(rows, clusters, *format, *minMembers)
 
 	case "bench":
 		fs := flag.NewFlagSet("bench", flag.ExitOnError)
 		limit := fs.Int("limit", 0, "max conversations to evaluate (0 = all)")
 		baseline := fs.Bool("baseline", false, "baseline mode: episode FTS only, no graph extraction")
+		personalKey := fs.String("personal-key", "", "enable KPT retrieval in LoCoMo with this personal key")
 		qaModel := fs.String("qa-model", "", "override QA answering model: 'mistral-small-2506' etc (default: same as extraction model)")
 		qaOnly := fs.Bool("qa-only", false, "skip ingestion, run QA on existing DB (use with -qa-model for fast model swapping)")
 		judgeModel := fs.String("judge", "", "LLM judge model for semantic evaluation: 'mistral-small-2506' (requires MISTRAL_API_KEY)")
 		_ = fs.Parse(os.Args[2:])
 		if fs.NArg() < 1 {
-			fatalf("usage: ultramemory bench [-limit N] [-baseline] [-qa-model MODEL] [-qa-only] [-judge MODEL] <locomo10.json>")
+			fatalf("usage: ultramemory bench [-limit N] [-baseline] [-personal-key KEY] [-qa-model MODEL] [-qa-only] [-judge MODEL] <locomo10.json>")
 		}
 		if !*qaOnly {
 			must(runtimeProfile.ping(ctx), "ping runtime")
@@ -274,7 +294,7 @@ func main() {
 			slog.Info("LLM judge", "model", *judgeModel, "provider", "mistral")
 		}
 
-		result, err := bench.RunLoCoMo(ctx, fs.Arg(0), db, runtimeProfile.extractor, runtimeProfile.embedder, qaAnswerer, judge, resolveThreshold, *limit, *baseline, *qaOnly)
+		result, err := bench.RunLoCoMo(ctx, fs.Arg(0), db, runtimeProfile.extractor, runtimeProfile.embedder, qaAnswerer, judge, resolveThreshold, *limit, *baseline, *qaOnly, *personalKey)
 		must(err, "bench")
 		bench.PrintResult(result)
 
@@ -285,6 +305,15 @@ func main() {
 		_ = fs.Parse(os.Args[2:])
 		if *threshold <= 0 || *threshold > 1 {
 			fatalf("--threshold must be in (0, 1], got %g", *threshold)
+		}
+		if personalKey != "" {
+			result, err := db.ResolveSecureEntities(ctx, groupID, personalKey, store.ResolveConfig{
+				Threshold: *threshold,
+				DryRun:    *dryRun,
+			})
+			must(err, "resolve secure entities")
+			printResolveResult(result, *dryRun)
+			break
 		}
 		result, err := db.ResolveEntities(ctx, groupID, store.ResolveConfig{
 			Threshold: *threshold,
@@ -306,12 +335,33 @@ func main() {
 		ricci := fs.Bool("ricci", false, "use Mutual-kNN + ORC instead of Louvain")
 		resolution := fs.Float64("resolution", 1.0, "Louvain resolution (higher = more, smaller communities)")
 		_ = fs.Parse(os.Args[2:])
-		if *detect && *ricci {
+		if *detect && *ricci && personalKey == "" {
 			fmt.Fprintln(os.Stderr, "Running Mutual-kNN + ORC + Louvain…")
 			cr, err := db.MutualKNNCommunities(ctx, groupID, 20, *resolution)
 			must(err, "mutual-knn communities")
 			fmt.Fprintf(os.Stderr, "✓ %d communities across %d entities (Mutual-kNN + ORC)\n",
 				cr.Communities, cr.Entities)
+		}
+		if personalKey != "" {
+			if *detect {
+				cr := store.CommunityResult{}
+				err := error(nil)
+				if *ricci {
+					fmt.Fprintln(os.Stderr, "Running secure ORC + Louvain community detection on the encrypted entity graph…")
+					cr, err = db.SecureRicciCommunities(ctx, groupID, *resolution)
+				}
+				if !*ricci {
+					fmt.Fprintln(os.Stderr, "Running secure community detection on the encrypted entity graph…")
+					cr, err = db.DetectCommunities(ctx, groupID, *resolution)
+				}
+				must(err, "detect secure communities")
+				fmt.Fprintf(os.Stderr, "✓ %d secure communities across %d entities\n", cr.Communities, cr.Entities)
+				must(graph.GenerateSecureCommunityReports(ctx, db, groupID, personalKey), "generate secure community reports")
+			}
+			communities, err := db.ListSecureCommunities(ctx, groupID, personalKey)
+			must(err, "list secure communities")
+			printCommunitySummaries(communities, *format, *minMembers)
+			break
 		}
 		if *detect && !*ricci {
 			fmt.Fprintln(os.Stderr, "Running Louvain community detection…")
@@ -334,6 +384,34 @@ func main() {
 		bridges := fs.Int("bridges", 0, "show top N bridge edges (most negative curvature)")
 		format := fs.String("format", "text", "output format: text|json")
 		_ = fs.Parse(os.Args[2:])
+		if personalKey != "" {
+			curvatures, stats, err := db.ComputeSecureGraphCurvatures(ctx, groupID, personalKey)
+			must(err, "compute secure curvatures")
+			printCurvatureStats(stats, *format)
+			if *persist {
+				must(db.StoreCurvatures(ctx, groupID, curvatures), "store secure curvatures")
+			}
+			if *bridges > 0 {
+				if *persist {
+					bridges, err := db.TopSecureBridges(ctx, groupID, *bridges, personalKey)
+					must(err, "top secure bridges")
+					printBridges(bridges, *format)
+					break
+				}
+				slices.SortFunc(curvatures, func(a, b store.EdgeCurvature) int {
+					if a.Curvature < b.Curvature {
+						return -1
+					}
+					if a.Curvature > b.Curvature {
+						return 1
+					}
+					return 0
+				})
+				n := min(*bridges, len(curvatures))
+				printBridges(curvatures[:n], *format)
+			}
+			break
+		}
 
 		// If -bridges without computation, just query stored curvatures.
 		if *bridges > 0 && !*persist {
@@ -379,7 +457,7 @@ func main() {
 		fs := flag.NewFlagSet("status", flag.ExitOnError)
 		format := fs.String("format", "text", "output format: text|json")
 		_ = fs.Parse(os.Args[2:])
-		printStatus(ctx, db, groupID, *format)
+		printStatus(ctx, db, groupID, secureMethod, personalKey != "", *format)
 
 	default:
 		usage()
@@ -391,8 +469,9 @@ const staleJobTimeout = 5 * time.Minute
 
 // runWorker polls the SQLite queue and processes jobs with max 1 concurrent LLM call.
 // extractor handles entity/edge extraction; embedder handles all embeddings for the active build.
-func runWorker(ctx context.Context, db *store.DB, extractor llm.EntityExtractor, embedder llm.Embedder, resolveThreshold float64, llmParallel int, groupID string) {
-	ext := graph.New(db, extractor, embedder, resolveThreshold, llmParallel)
+func runWorker(ctx context.Context, db *store.DB, extractor llm.EntityExtractor, embedder llm.Embedder, resolveThreshold float64, llmParallel int, groupID, personalKey string) {
+	ext := graph.New(db, extractor, embedder, resolveThreshold, llmParallel, personalKey)
+	secureMode := personalKey != ""
 	concurrency := runtime.NumCPU()
 	if concurrency > 4 {
 		concurrency = 4
@@ -402,20 +481,26 @@ func runWorker(ctx context.Context, db *store.DB, extractor llm.EntityExtractor,
 
 	// Worker pool — but LLM semaphore in Extractor limits actual LLM calls to 1.
 	jobs := make(chan *store.Job, concurrency)
+	var workerWG sync.WaitGroup
+	var inFlight atomic.Int64
 
 	for i := 0; i < concurrency; i++ {
+		workerWG.Add(1)
 		go func() {
+			defer workerWG.Done()
 			for job := range jobs {
 				if err := ext.ProcessJob(ctx, job.Payload, job.Attempts); err != nil {
 					slog.Error("job failed", "id", job.ID, "err", err)
 					if err := db.FailJob(context.Background(), job.ID, err.Error()); err != nil {
 						slog.Error("fail job", "err", err)
 					}
+					inFlight.Add(-1)
 					continue
 				}
 				if err := db.CompleteJob(context.Background(), job.ID); err != nil {
 					slog.Error("complete job", "err", err)
 				}
+				inFlight.Add(-1)
 			}
 		}()
 	}
@@ -432,6 +517,8 @@ func runWorker(ctx context.Context, db *store.DB, extractor llm.EntityExtractor,
 		select {
 		case <-ctx.Done():
 			close(jobs)
+			workerWG.Wait()
+			ext.Wait()
 			fmt.Fprintf(os.Stderr, "\n✓ Worker stopped. Processed %d chunks.\n", processed)
 			return
 		case <-ticker.C:
@@ -453,6 +540,7 @@ func runWorker(ctx context.Context, db *store.DB, extractor llm.EntityExtractor,
 				}
 				queueEmpty = false
 				communityDirty = true
+				inFlight.Add(1)
 				jobs <- job
 				processed++
 
@@ -470,7 +558,8 @@ func runWorker(ctx context.Context, db *store.DB, extractor llm.EntityExtractor,
 			}
 
 			// Run community detection once when queue drains after processing.
-			if queueEmpty && communityDirty {
+			if queueEmpty && communityDirty && inFlight.Load() == 0 {
+				ext.Wait()
 				slog.Info("queue drained — running community detection")
 				cr, err := db.DetectCommunities(ctx, groupID, 1.0)
 				if err != nil {
@@ -478,6 +567,9 @@ func runWorker(ctx context.Context, db *store.DB, extractor llm.EntityExtractor,
 				} else {
 					communityDirty = false
 					slog.Info("communities detected", "communities", cr.Communities, "entities", cr.Entities)
+					if secureMode {
+						continue
+					}
 					if err := graph.GenerateCommunityReports(ctx, db, groupID); err != nil {
 						slog.Error("community reports failed", "err", err)
 					}
@@ -553,11 +645,16 @@ func printSearch(results []graph.SearchResult, query, format string, maxTokens i
 	}
 }
 
-func printPersonalSearch(rows []store.SecureEpisodeIndexRow, hits []secureindex.SearchHit, query, format string) {
+func printPersonalSearch(rows []store.SecureEpisodeIndexRow, hits []secureindex.SearchHit, query, format string, maxTokens int) {
 	if format == "json" {
 		enc := json.NewEncoder(os.Stdout)
+		used := 0
 		for rank, hit := range hits {
 			row := rows[hit.Index]
+			cost := approxTokens(row.Source + row.Content)
+			if maxTokens > 0 && used+cost > maxTokens {
+				break
+			}
 			_ = enc.Encode(personalSearchHit{
 				Rank:    rank + 1,
 				UUID:    row.EpisodeUUID,
@@ -565,6 +662,7 @@ func printPersonalSearch(rows []store.SecureEpisodeIndexRow, hits []secureindex.
 				Source:  row.Source,
 				Content: row.Content,
 			})
+			used += cost
 		}
 		return
 	}
@@ -573,9 +671,17 @@ func printPersonalSearch(rows []store.SecureEpisodeIndexRow, hits []secureindex.
 		return
 	}
 	fmt.Printf("Secure results for %q:\n\n", query)
+	used := 0
 	for rank, hit := range hits {
 		row := rows[hit.Index]
+		cost := approxTokens(row.Source + row.Content)
+		if maxTokens > 0 && used+cost > maxTokens {
+			fmt.Printf("-- token budget reached (%d/%d tokens used, %d result(s) omitted) --\n",
+				used, maxTokens, len(hits)-rank)
+			break
+		}
 		fmt.Printf("%d. [%0.4f] %s\n   %s\n\n", rank+1, hit.Score, filepath.Base(row.Source), truncateLine(row.Content, 180))
+		used += cost
 	}
 }
 
@@ -621,13 +727,14 @@ func printPersonalClusters(rows []store.SecureEpisodeIndexRow, clusters []secure
 	}
 }
 
-func printStatus(ctx context.Context, db *store.DB, groupID, format string) {
+func printStatus(ctx context.Context, db *store.DB, groupID, method string, secureMode bool, format string) {
 	stats, err := db.QueueStats(ctx)
 	must(err, "queue stats")
 
 	episodes, _ := db.CountEpisodes(ctx, groupID)
 	entities, _ := db.CountEntities(ctx, groupID)
 	edges, _ := db.CountEdges(ctx, groupID)
+	secureEpisodes, _ := db.CountSecureEpisodes(ctx, groupID, method)
 
 	if format == "json" {
 		for _, s := range []string{"pending", "processing", "done", "failed"} {
@@ -638,10 +745,12 @@ func printStatus(ctx context.Context, db *store.DB, groupID, format string) {
 		curvTotal, curvBridges, curvInternal, curvMean := db.CurvatureStatus(ctx, groupID)
 		out := struct {
 			Graph struct {
-				Episodes int `json:"episodes"`
-				Entities int `json:"entities"`
-				Edges    int `json:"edges"`
+				Episodes       int `json:"episodes"`
+				Entities       int `json:"entities"`
+				Edges          int `json:"edges"`
+				SecureEpisodes int `json:"secure_episodes"`
 			} `json:"graph"`
+			Mode      string `json:"mode"`
 			Curvature *struct {
 				Edges    int     `json:"edges"`
 				Bridges  int     `json:"bridges"`
@@ -653,6 +762,12 @@ func printStatus(ctx context.Context, db *store.DB, groupID, format string) {
 		out.Graph.Episodes = episodes
 		out.Graph.Entities = entities
 		out.Graph.Edges = edges
+		out.Graph.SecureEpisodes = secureEpisodes
+		if secureMode {
+			out.Mode = "kpt"
+		} else {
+			out.Mode = "graph"
+		}
 		out.Queue = stats
 		if curvTotal > 0 {
 			out.Curvature = &struct {
@@ -670,6 +785,12 @@ func printStatus(ctx context.Context, db *store.DB, groupID, format string) {
 	fmt.Printf("  episodes : %d\n", episodes)
 	fmt.Printf("  entities : %d\n", entities)
 	fmt.Printf("  edges    : %d\n", edges)
+	fmt.Printf("  secure   : %d\n", secureEpisodes)
+	if secureMode {
+		fmt.Printf("  mode     : kpt\n")
+	} else {
+		fmt.Printf("  mode     : graph\n")
+	}
 
 	curvTotal, curvBridges, curvInternal, curvMean := db.CurvatureStatus(ctx, groupID)
 	if curvTotal > 0 {
@@ -689,7 +810,10 @@ func printStatus(ctx context.Context, db *store.DB, groupID, format string) {
 func printCommunities(ctx context.Context, db *store.DB, groupID, format string, minMembers int) {
 	communities, err := db.ListCommunities(ctx, groupID)
 	must(err, "list communities")
+	printCommunitySummaries(communities, format, minMembers)
+}
 
+func printCommunitySummaries(communities []store.CommunitySummary, format string, minMembers int) {
 	// Filter by minimum member count.
 	filtered := communities[:0]
 	for _, c := range communities {
@@ -736,27 +860,37 @@ func printResolveResult(r store.ResolveResult, dryRun bool) {
 	fmt.Printf("  episodes relinked : %d\n", r.EpisodesRelinked)
 }
 
+func printSecureResolveResult(r store.SecureResolveResult, dryRun bool) {
+	mode := ""
+	if dryRun {
+		mode = " (dry-run)"
+	}
+	fmt.Printf("Secure episode resolution%s:\n", mode)
+	fmt.Printf("  clusters found  : %d\n", r.ClustersFound)
+	fmt.Printf("  episodes merged : %d\n", r.EpisodesMerged)
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, "ultramemory %s — local knowledge graph (%s build)\n\n", version, buildProviderName)
 	fmt.Fprintf(os.Stderr, `Commands:
   run     <path>   ingest directory + start worker (all-in-one)  [-source URL]
   ingest  <path>   queue all text files for processing         [-source URL]
   worker           process queued jobs (blocking)
-  search  <query>  hybrid search over the graph (flags: -format text|json, -max-tokens N)
+  search  <query>  graph search, or KPT search when MEMORY_PERSONAL_KEY is set
   personal-index   build keyed KPT episode index from existing embeddings     (-key, -method)
   personal-search  keyed KPT search over episodes                             (-key, -method, -limit, -format)
   personal-cluster keyed KPT clustering over episode semantics                (-key, -method, -k, -min-score)
   retry            requeue all failed jobs for reprocessing
-  resolve          merge near-duplicate entities (flags: -dry-run, -threshold 0.85)
-  communities      detect + list communities                     (flags: -detect, -ricci, -format, -resolution)
-  curvature        compute Ollivier-Ricci edge curvatures       (flags: -store, -bridges N, -format)
+  resolve          merge near-duplicates; entities in graph mode, episodes in KPT mode
+  communities      graph communities, or KPT communities when MEMORY_PERSONAL_KEY is set
+  curvature        compute ORC on graph edges, or KPT episode graph in secure mode
   bench   <json>   evaluate against LoCoMo benchmark (flags: -limit N, -baseline)
   status           show queue and graph statistics
 
 Environment:
   MEMORY_DB                  path to SQLite file          (default: memory-local.db)
   MEMORY_GROUP               namespace/group              (default: default)
-  MEMORY_PERSONAL_KEY        keyed episode search/cluster secret
+  MEMORY_PERSONAL_KEY        enables KPT-first ingest/search/clustering and encrypts queue + episode payloads at rest
   MEMORY_RESOLVE_THRESHOLD   resolve similarity           (default: 0.92)
   MEMORY_LLM_PARALLEL        concurrent LLM calls         (default: %d)
 %s`, defaultLLMParallel, buildEnvironmentHelp)
@@ -788,6 +922,44 @@ func must(err error, msg string) {
 	if err != nil {
 		fatalf("%s: %v", msg, err)
 	}
+}
+
+func runSecureSearch(ctx context.Context, db *store.DB, embedder llm.Embedder, personalKey, groupID, methodName, query, format string, maxTokens int) {
+	rows, err := db.AllSecureEpisodes(ctx, groupID, methodName)
+	must(err, "load secure index")
+	if len(rows) == 0 {
+		fatalf("no secure episode index found for group %q and method %q", groupID, methodName)
+	}
+
+	queryEmb, err := embedder.Embed(ctx, query)
+	must(err, "embed query")
+	rows, err = decryptSecureRows(rows, personalKey)
+	must(err, "decrypt secure rows")
+
+	method := secureindex.NewMethod(personalKey, len(queryEmb))
+	queryState := method.EncodeQuery(queryEmb)
+	hits := method.Search(secureStates(rows), queryState, 10)
+	printPersonalSearch(rows, hits, query, format, maxTokens)
+}
+
+func decryptSecureRows(rows []store.SecureEpisodeIndexRow, personalKey string) ([]store.SecureEpisodeIndexRow, error) {
+	out := make([]store.SecureEpisodeIndexRow, 0, len(rows))
+	for _, row := range rows {
+		content, err := secureindex.DecryptString(personalKey, "episode-content", row.Content)
+		if err != nil {
+			row.Content = "<entschlüsselung fehlgeschlagen>"
+		} else {
+			row.Content = content
+		}
+		source, err := secureindex.DecryptString(personalKey, "episode-source", row.Source)
+		if err != nil {
+			row.Source = "<locked>"
+		} else {
+			row.Source = source
+		}
+		out = append(out, row)
+	}
+	return out, nil
 }
 
 func secureStates(rows []store.SecureEpisodeIndexRow) []secureindex.State {

@@ -21,6 +21,39 @@ type SecureEpisodeIndexRow struct {
 	ModeEnergy   []float32
 }
 
+// UpsertSecureEpisodeIndexRow inserts or replaces one keyed episode row.
+func (d *DB) UpsertSecureEpisodeIndexRow(ctx context.Context, row SecureEpisodeIndexRow) error {
+	_, err := d.sql.ExecContext(ctx, `
+		INSERT INTO secure_episode_index (
+			episode_uuid, group_id, method, public_layer, base_vec, base_wave_imag, wave_real, wave_imag, mode_weight, mode_energy, key_probe
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(episode_uuid, group_id, method) DO UPDATE SET
+			public_layer = excluded.public_layer,
+			base_vec = excluded.base_vec,
+			base_wave_imag = excluded.base_wave_imag,
+			wave_real = excluded.wave_real,
+			wave_imag = excluded.wave_imag,
+			mode_weight = excluded.mode_weight,
+			mode_energy = excluded.mode_energy,
+			key_probe = excluded.key_probe`,
+		row.EpisodeUUID,
+		row.GroupID,
+		row.Method,
+		EncodeEmbedding(row.Public),
+		EncodeEmbedding(row.BaseWaveReal),
+		EncodeEmbedding(row.BaseWaveImag),
+		EncodeEmbedding(row.WaveReal),
+		EncodeEmbedding(row.WaveImag),
+		EncodeEmbedding(row.ModeWeight),
+		EncodeEmbedding(row.ModeEnergy),
+		EncodeEmbedding(nil),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert secure index row %s: %w", row.EpisodeUUID, err)
+	}
+	return nil
+}
+
 // ReplaceSecureEpisodeIndex replaces the keyed episode index for one group/method.
 func (d *DB) ReplaceSecureEpisodeIndex(ctx context.Context, groupID, method string, rows []SecureEpisodeIndexRow) error {
 	tx, err := d.sql.BeginTx(ctx, nil)

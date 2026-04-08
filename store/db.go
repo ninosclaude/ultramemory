@@ -42,6 +42,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
 CREATE TABLE IF NOT EXISTS entities (
 	uuid        TEXT PRIMARY KEY,
 	name        TEXT NOT NULL,
+	lookup_key  TEXT NOT NULL DEFAULT '',
 	entity_type TEXT NOT NULL,
 	group_id    TEXT NOT NULL DEFAULT 'default',
 	created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS edges (
 	source_uuid TEXT NOT NULL,
 	target_uuid TEXT NOT NULL,
 	name        TEXT NOT NULL,
+	lookup_key  TEXT NOT NULL DEFAULT '',
 	fact        TEXT NOT NULL,
 	group_id    TEXT NOT NULL DEFAULT 'default',
 	valid_at    TEXT,
@@ -106,6 +108,9 @@ CREATE INDEX IF NOT EXISTS idx_jobs_pending
 CREATE INDEX IF NOT EXISTS idx_entities_group
 	ON entities(group_id, name);
 
+CREATE INDEX IF NOT EXISTS idx_entities_lookup
+	ON entities(group_id, lookup_key);
+
 -- Composite indexes for GetNeighbors (MAGMA traversal hot path).
 -- Filters always combine source_uuid/target_uuid with group_id;
 -- composite indexes let SQLite seek directly without a post-filter scan.
@@ -117,6 +122,9 @@ CREATE INDEX IF NOT EXISTS idx_edges_tgt_grp
 
 CREATE INDEX IF NOT EXISTS idx_edges_group
 	ON edges(group_id);
+
+CREATE INDEX IF NOT EXISTS idx_edges_lookup
+	ON edges(group_id, lookup_key);
 
 CREATE TABLE IF NOT EXISTS community_reports (
 	community_id INTEGER NOT NULL,
@@ -150,7 +158,9 @@ CREATE INDEX IF NOT EXISTS idx_secure_episode_index_group
 const migrations = `
 ALTER TABLE entities ADD COLUMN community_id INTEGER NOT NULL DEFAULT -1;
 ALTER TABLE entities ADD COLUMN description TEXT NOT NULL DEFAULT '';
+ALTER TABLE entities ADD COLUMN lookup_key TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_entities_community ON entities(group_id, community_id);
+CREATE INDEX IF NOT EXISTS idx_entities_lookup ON entities(group_id, lookup_key);
 CREATE TABLE IF NOT EXISTS edge_curvatures (
 	source_uuid TEXT NOT NULL,
 	target_uuid TEXT NOT NULL,
@@ -167,6 +177,8 @@ CREATE TABLE IF NOT EXISTS mutual_knn_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_mknn_group ON mutual_knn_edges(group_id);
 ALTER TABLE jobs ADD COLUMN not_before DATETIME;
+ALTER TABLE edges ADD COLUMN lookup_key TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_edges_lookup ON edges(group_id, lookup_key);
 CREATE TABLE IF NOT EXISTS secure_episode_index (
 	episode_uuid  TEXT NOT NULL,
 	group_id      TEXT NOT NULL,

@@ -12,6 +12,7 @@ type Edge struct {
 	SourceUUID string
 	TargetUUID string
 	Name       string // relation type e.g. WORKS_AT
+	LookupKey  string
 	Fact       string // natural language fact
 	GroupID    string
 	ValidAt    *string
@@ -24,12 +25,17 @@ type Edge struct {
 // Deduplicates by (source_uuid, target_uuid, name, group_id).
 func (d *DB) UpsertEdge(ctx context.Context, e Edge) error {
 	var existing string
-	err := d.sql.QueryRowContext(ctx,
-		`SELECT uuid FROM edges
+	query := `SELECT uuid FROM edges
 		 WHERE source_uuid = ? AND target_uuid = ? AND name = ? AND group_id = ?
-		 LIMIT 1`,
-		e.SourceUUID, e.TargetUUID, e.Name, e.GroupID,
-	).Scan(&existing)
+		 LIMIT 1`
+	args := []any{e.SourceUUID, e.TargetUUID, e.Name, e.GroupID}
+	if e.LookupKey != "" {
+		query = `SELECT uuid FROM edges
+		 WHERE group_id = ? AND lookup_key = ?
+		 LIMIT 1`
+		args = []any{e.GroupID, e.LookupKey}
+	}
+	err := d.sql.QueryRowContext(ctx, query, args...).Scan(&existing)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("lookup edge: %w", err)
 	}
@@ -41,8 +47,8 @@ func (d *DB) UpsertEdge(ctx context.Context, e Edge) error {
 
 	if existing != "" {
 		if _, err = d.sql.ExecContext(ctx,
-			`UPDATE edges SET fact = ?, embedding = ? WHERE uuid = ?`,
-			e.Fact, embBlob, existing,
+			`UPDATE edges SET fact = ?, embedding = ?, lookup_key = CASE WHEN ? != '' THEN ? ELSE lookup_key END WHERE uuid = ?`,
+			e.Fact, embBlob, e.LookupKey, e.LookupKey, existing,
 		); err != nil {
 			return err
 		}
@@ -52,6 +58,9 @@ func (d *DB) UpsertEdge(ctx context.Context, e Edge) error {
 		); err != nil {
 			return err
 		}
+		if e.LookupKey != "" {
+			return nil
+		}
 		_, err = d.sql.ExecContext(ctx,
 			`INSERT INTO edges_fts (uuid, fact) VALUES (?, ?)`, existing, e.Fact,
 		)
@@ -59,9 +68,9 @@ func (d *DB) UpsertEdge(ctx context.Context, e Edge) error {
 	}
 
 	_, err = d.sql.ExecContext(ctx, `
-		INSERT INTO edges (uuid, source_uuid, target_uuid, name, fact, group_id, valid_at, invalid_at, episodes, embedding)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.UUID, e.SourceUUID, e.TargetUUID, e.Name, e.Fact,
+		INSERT INTO edges (uuid, source_uuid, target_uuid, name, lookup_key, fact, group_id, valid_at, invalid_at, episodes, embedding)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.UUID, e.SourceUUID, e.TargetUUID, e.Name, e.LookupKey, e.Fact,
 		e.GroupID, e.ValidAt, e.InvalidAt, e.Episodes, embBlob,
 	)
 	if err != nil {
@@ -72,6 +81,9 @@ func (d *DB) UpsertEdge(ctx context.Context, e Edge) error {
 		`DELETE FROM edges_fts WHERE uuid = ?`, e.UUID,
 	); err != nil {
 		return err
+	}
+	if e.LookupKey != "" {
+		return nil
 	}
 	_, err = d.sql.ExecContext(ctx,
 		`INSERT INTO edges_fts (uuid, fact) VALUES (?, ?)`, e.UUID, e.Fact,
@@ -95,7 +107,7 @@ func (d *DB) SearchEdgesFTS(ctx context.Context, query, groupID string, limit in
 		return nil, nil
 	}
 	rows, err := d.sql.QueryContext(ctx, `
-		SELECT e.uuid, e.source_uuid, e.target_uuid, e.name, e.fact, e.valid_at, e.embedding
+		SELECT e.uuid, e.source_uuid, e.target_uuid, e.name, e.lookup_key, e.fact, e.valid_at, e.embedding
 		FROM edges_fts f
 		JOIN edges e ON e.uuid = f.uuid
 		WHERE edges_fts MATCH ? AND e.group_id = ?
@@ -112,7 +124,7 @@ func (d *DB) SearchEdgesFTS(ctx context.Context, query, groupID string, limit in
 	for rows.Next() {
 		var e Edge
 		var blob []byte
-		if err := rows.Scan(&e.UUID, &e.SourceUUID, &e.TargetUUID, &e.Name, &e.Fact, &e.ValidAt, &blob); err != nil {
+		if err := rows.Scan(&e.UUID, &e.SourceUUID, &e.TargetUUID, &e.Name, &e.LookupKey, &e.Fact, &e.ValidAt, &blob); err != nil {
 			return nil, err
 		}
 		e.GroupID = groupID
@@ -138,7 +150,7 @@ func (d *DB) EdgesForEntities(ctx context.Context, uuids []string, groupID strin
 	}
 	args = append(args, groupID)
 	rows, err := d.sql.QueryContext(ctx, `
-		SELECT uuid, source_uuid, target_uuid, name, fact, valid_at
+		SELECT uuid, source_uuid, target_uuid, name, lookup_key, fact, valid_at
 		FROM edges
 		WHERE (source_uuid IN (`+ph+`) OR target_uuid IN (`+ph+`))
 		  AND group_id = ?`, args...)
@@ -150,7 +162,7 @@ func (d *DB) EdgesForEntities(ctx context.Context, uuids []string, groupID strin
 	var out []Edge
 	for rows.Next() {
 		var e Edge
-		if err := rows.Scan(&e.UUID, &e.SourceUUID, &e.TargetUUID, &e.Name, &e.Fact, &e.ValidAt); err != nil {
+		if err := rows.Scan(&e.UUID, &e.SourceUUID, &e.TargetUUID, &e.Name, &e.LookupKey, &e.Fact, &e.ValidAt); err != nil {
 			return nil, err
 		}
 		e.GroupID = groupID
@@ -162,7 +174,7 @@ func (d *DB) EdgesForEntities(ctx context.Context, uuids []string, groupID strin
 // AllEdgesWithEmbeddings loads all edges with embeddings for vector search.
 func (d *DB) AllEdgesWithEmbeddings(ctx context.Context, groupID string) ([]Edge, error) {
 	rows, err := d.sql.QueryContext(ctx,
-		`SELECT uuid, source_uuid, target_uuid, name, fact, valid_at, embedding
+		`SELECT uuid, source_uuid, target_uuid, name, lookup_key, fact, valid_at, embedding
 		 FROM edges
 		 WHERE group_id = ? AND embedding IS NOT NULL`,
 		groupID,
@@ -176,7 +188,46 @@ func (d *DB) AllEdgesWithEmbeddings(ctx context.Context, groupID string) ([]Edge
 	for rows.Next() {
 		var e Edge
 		var blob []byte
-		if err := rows.Scan(&e.UUID, &e.SourceUUID, &e.TargetUUID, &e.Name, &e.Fact, &e.ValidAt, &blob); err != nil {
+		if err := rows.Scan(&e.UUID, &e.SourceUUID, &e.TargetUUID, &e.Name, &e.LookupKey, &e.Fact, &e.ValidAt, &blob); err != nil {
+			return nil, err
+		}
+		e.GroupID = groupID
+		e.Embedding = DecodeEmbedding(blob)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// AllEdges loads all edges for one group, regardless of embedding presence.
+func (d *DB) AllEdges(ctx context.Context, groupID string) ([]Edge, error) {
+	rows, err := d.sql.QueryContext(ctx, `
+		SELECT uuid, source_uuid, target_uuid, name, lookup_key, fact, valid_at, invalid_at, episodes, embedding
+		FROM edges
+		WHERE group_id = ?
+		ORDER BY created_at ASC, uuid ASC`,
+		groupID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+
+	var out []Edge
+	for rows.Next() {
+		var e Edge
+		var blob []byte
+		if err := rows.Scan(
+			&e.UUID,
+			&e.SourceUUID,
+			&e.TargetUUID,
+			&e.Name,
+			&e.LookupKey,
+			&e.Fact,
+			&e.ValidAt,
+			&e.InvalidAt,
+			&e.Episodes,
+			&blob,
+		); err != nil {
 			return nil, err
 		}
 		e.GroupID = groupID

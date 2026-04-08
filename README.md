@@ -217,6 +217,25 @@ The repository now also includes an experimental KPT-backed keyed episode layer 
 
 This path is intentionally separate from the graph pipeline. The existing graph search and community detection continue to work as before; the personal secure index is an opt-in layer for "search/clustering only with the right key" experiments.
 
+Minimaler KPT-Flow auf demselben Ultramemory-Stack:
+
+```bash
+# 1. Normale Episoden ingestieren und embeddieren
+ultramemory run ./my-docs
+
+# 2. KPT-Zusatzindex aus den vorhandenen Episode-Embeddings bauen
+MEMORY_PERSONAL_KEY="mein-passwort" ultramemory personal-index
+
+# 3. Normale Suche bleibt wie bisher
+ultramemory search "katzen mit decken"
+
+# 4. Keyed KPT-Suche auf denselben Episoden
+MEMORY_PERSONAL_KEY="mein-passwort" ultramemory personal-search "katzen mit decken"
+
+# 5. Keyed Clustering auf demselben Episodenbestand
+MEMORY_PERSONAL_KEY="mein-passwort" ultramemory personal-cluster
+```
+
 ### Search pipeline detail
 
 ```

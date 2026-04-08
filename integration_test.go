@@ -70,7 +70,7 @@ func TestIntegrationIngestAndSearch(t *testing.T) {
 	}
 
 	// Process all jobs synchronously (no goroutines, deterministic for tests)
-	ext := graph.New(db, client, client, 0.92, 1)
+	ext := graph.New(db, client, client, 0.92, 1, "")
 	processed := 0
 	failed := 0
 	for {

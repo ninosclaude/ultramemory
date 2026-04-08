@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sharpner/ultramemory/graph"
 	"github.com/sharpner/ultramemory/llm"
+	"github.com/sharpner/ultramemory/secureindex"
 	"github.com/sharpner/ultramemory/store"
 )
 
@@ -164,7 +165,7 @@ type Judge interface {
 // qaAnswerer overrides the QA answering model when set.
 // When qaOnly is true, ingestion is skipped — DB must already be populated.
 // judge optionally evaluates each answer for semantic correctness (LLM-as-judge).
-func RunLoCoMo(ctx context.Context, dataPath string, db *store.DB, extractor llm.EntityExtractor, embedder llm.Embedder, answerer llm.Answerer, judge Judge, resolveThreshold float64, limit int, baseline, qaOnly bool) (*Result, error) {
+func RunLoCoMo(ctx context.Context, dataPath string, db *store.DB, extractor llm.EntityExtractor, embedder llm.Embedder, answerer llm.Answerer, judge Judge, resolveThreshold float64, limit int, baseline, qaOnly bool, personalKey string) (*Result, error) {
 	conversations, err := parseLoCoMo(dataPath)
 	if err != nil {
 		return nil, err
@@ -176,6 +177,9 @@ func RunLoCoMo(ctx context.Context, dataPath string, db *store.DB, extractor llm
 	mode := "graph"
 	if baseline {
 		mode = "baseline"
+	}
+	if personalKey != "" {
+		mode = "kpt"
 	}
 
 	if answerer == nil {
@@ -209,6 +213,10 @@ func RunLoCoMo(ctx context.Context, dataPath string, db *store.DB, extractor llm
 		)
 
 		if !qaOnly {
+			var secureExtractor *graph.Extractor
+			if personalKey != "" && !baseline {
+				secureExtractor = graph.New(db, extractor, embedder, resolveThreshold, 1, personalKey)
+			}
 			// Ingest all sessions.
 			for _, sess := range conv.Sessions {
 				text := formatSession(sess)
@@ -229,8 +237,14 @@ func RunLoCoMo(ctx context.Context, dataPath string, db *store.DB, extractor llm
 						}
 						continue
 					}
+					if personalKey != "" {
+						if err := secureExtractor.Process(ctx, chunk, source, groupID); err != nil {
+							slog.Warn("secure extraction failed", "conv", conv.SampleID, "session", sess.Number, "err", err)
+						}
+						continue
+					}
 
-					ext := graph.New(db, extractor, embedder, resolveThreshold, 1)
+					ext := graph.New(db, extractor, embedder, resolveThreshold, 1, "")
 					if err := ext.Process(ctx, chunk, source, groupID); err != nil {
 						slog.Warn("extraction failed", "conv", conv.SampleID, "session", sess.Number, "err", err)
 					}
@@ -238,7 +252,7 @@ func RunLoCoMo(ctx context.Context, dataPath string, db *store.DB, extractor llm
 			}
 
 			// Run community detection + report generation after ingestion (Leiden §4).
-			if !baseline {
+			if !baseline && personalKey == "" {
 				result, err := db.DetectCommunities(ctx, groupID, 1.0)
 				if err != nil {
 					slog.Warn("community detection failed", "err", err)
@@ -271,6 +285,30 @@ func RunLoCoMo(ctx context.Context, dataPath string, db *store.DB, extractor llm
 					}
 				}
 			}
+			if personalKey != "" {
+				if secureExtractor != nil {
+					secureExtractor.Wait()
+				}
+				result, err := db.DetectCommunities(ctx, groupID, 1.0)
+				if err != nil {
+					slog.Warn("secure community detection failed", "err", err)
+				} else {
+					slog.Info("secure communities detected",
+						"conv", conv.SampleID,
+						"communities", result.Communities,
+						"entities", result.Entities,
+					)
+					if err := graph.GenerateSecureCommunityReports(ctx, db, groupID, personalKey); err != nil {
+						slog.Warn("secure community report generation failed", "err", err)
+					}
+				}
+			}
+
+			if personalKey != "" {
+				if err := buildPersonalIndex(ctx, db, groupID, personalKey); err != nil {
+					return nil, fmt.Errorf("build kpt index for %s: %w", conv.SampleID, err)
+				}
+			}
 		}
 
 		slog.Info("evaluating QA", "mode", mode, "conv", conv.SampleID, "questions", len(conv.QA))
@@ -290,6 +328,14 @@ func RunLoCoMo(ctx context.Context, dataPath string, db *store.DB, extractor llm
 					continue
 				}
 				contextStr = formatEpisodeContext(episodes)
+			} else if personalKey != "" {
+				results, err := graph.SecureSearch(ctx, db, embedder, personalKey, groupID, "kpt-v1", qa.Question, 25)
+				if err != nil {
+					slog.Warn("kpt search failed", "question", qa.Question, "err", err)
+					scores = append(scores, qaScore{qa.Category, 0, 0, -1})
+					continue
+				}
+				contextStr = formatContext(results)
 			} else {
 				results, err := graph.Search(ctx, db, embedder, qa.Question, groupID, 25)
 				if err != nil {
@@ -338,6 +384,84 @@ func RunLoCoMo(ctx context.Context, dataPath string, db *store.DB, extractor llm
 	}
 
 	return aggregate(scores, time.Since(start)), nil
+}
+
+func buildPersonalIndex(ctx context.Context, db *store.DB, groupID, personalKey string) error {
+	count, err := db.CountSecureEpisodes(ctx, groupID, "kpt-v1")
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	episodes, err := db.AllEpisodesWithEmbeddings(ctx, groupID)
+	if err != nil {
+		return err
+	}
+	if len(episodes) == 0 {
+		return fmt.Errorf("no episodes with embeddings for group %q", groupID)
+	}
+
+	method := secureindex.NewMethod(personalKey, len(episodes[0].Embedding))
+	rows := make([]store.SecureEpisodeIndexRow, 0, len(episodes))
+	for _, episode := range episodes {
+		if len(episode.Embedding) == 0 {
+			continue
+		}
+		state := method.EncodeDoc(episode.Embedding)
+		rows = append(rows, store.SecureEpisodeIndexRow{
+			EpisodeUUID:  episode.UUID,
+			GroupID:      groupID,
+			Method:       "kpt-v1",
+			Public:       state.Public,
+			BaseWaveReal: state.BaseWaveReal,
+			BaseWaveImag: state.BaseWaveImag,
+			WaveReal:     state.WaveReal,
+			WaveImag:     state.WaveImag,
+			ModeWeight:   state.ModeWeight,
+			ModeEnergy:   state.ModeEnergy,
+		})
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("no secure rows built for group %q", groupID)
+	}
+	return db.ReplaceSecureEpisodeIndex(ctx, groupID, "kpt-v1", rows)
+}
+
+func searchPersonalContext(ctx context.Context, db *store.DB, embedder llm.Embedder, query, groupID, personalKey string) (string, error) {
+	rows, err := db.AllSecureEpisodes(ctx, groupID, "kpt-v1")
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "(no relevant dialogue found)", nil
+	}
+
+	queryEmbedding, err := embedder.Embed(ctx, query)
+	if err != nil {
+		return "", err
+	}
+	method := secureindex.NewMethod(personalKey, len(queryEmbedding))
+	queryState := method.EncodeQuery(queryEmbedding)
+	states := make([]secureindex.State, 0, len(rows))
+	for _, row := range rows {
+		row.Content, err = secureindex.DecryptString(personalKey, "episode-content", row.Content)
+		if err != nil {
+			return "", fmt.Errorf("decrypt episode content: %w", err)
+		}
+		states = append(states, secureindex.State{
+			Public:       row.Public,
+			BaseWaveReal: row.BaseWaveReal,
+			BaseWaveImag: row.BaseWaveImag,
+			WaveReal:     row.WaveReal,
+			WaveImag:     row.WaveImag,
+			ModeWeight:   row.ModeWeight,
+			ModeEnergy:   row.ModeEnergy,
+		})
+	}
+	hits := method.Search(states, queryState, 10)
+	return formatSecureEpisodeContext(rows, hits), nil
 }
 
 // PrintResult outputs the benchmark results as a table.
@@ -546,6 +670,22 @@ func formatEpisodeContext(episodes []store.Episode) string {
 	var b strings.Builder
 	for i, ep := range episodes {
 		body := ep.Content
+		if len(body) > 500 {
+			body = body[:500] + "..."
+		}
+		fmt.Fprintf(&b, "%d. %s\n", i+1, body)
+	}
+	return b.String()
+}
+
+func formatSecureEpisodeContext(rows []store.SecureEpisodeIndexRow, hits []secureindex.SearchHit) string {
+	if len(hits) == 0 {
+		return "(no relevant dialogue found)"
+	}
+	var b strings.Builder
+	for i, hit := range hits {
+		row := rows[hit.Index]
+		body := row.Content
 		if len(body) > 500 {
 			body = body[:500] + "..."
 		}

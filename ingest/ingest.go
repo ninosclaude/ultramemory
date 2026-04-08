@@ -15,6 +15,7 @@ import (
 
 	"github.com/sharpner/ultramemory/graph"
 	"github.com/sharpner/ultramemory/llm"
+	"github.com/sharpner/ultramemory/secureindex"
 	"github.com/sharpner/ultramemory/store"
 )
 
@@ -27,6 +28,7 @@ const (
 type Walker struct {
 	db             *store.DB
 	groupID        string
+	personalKey    string
 	sourceOverride string  // if set, used as source instead of file path
 	pdftotextBin   string  // optional: poppler pdftotext
 	pdftoppmBin    string  // optional: poppler pdftoppm (needed for OCR fallback)
@@ -62,6 +64,12 @@ func (w *Walker) WithSource(source string) *Walker {
 // Only used when both pdftotext and tesseract produce no output.
 func (w *Walker) WithOCR(client llm.OCR) *Walker {
 	w.ocrClient = client
+	return w
+}
+
+// WithPersonalKey enables encrypted queue payloads for KPT-first ingestion.
+func (w *Walker) WithPersonalKey(personalKey string) *Walker {
+	w.personalKey = personalKey
 	return w
 }
 
@@ -247,11 +255,26 @@ func (w *Walker) enqueueChunks(ctx context.Context, text, source string, total *
 		if len(c) < 50 {
 			continue
 		}
-		payload, err := json.Marshal(graph.IngestPayload{
+		p := graph.IngestPayload{
 			Content: c,
 			Source:  source,
 			GroupID: w.groupID,
-		})
+		}
+		if w.personalKey != "" {
+			contentCiphertext, err := secureindex.EncryptString(w.personalKey, "ingest-content", c)
+			if err != nil {
+				return fmt.Errorf("encrypt content payload: %w", err)
+			}
+			sourceCiphertext, err := secureindex.EncryptString(w.personalKey, "ingest-source", source)
+			if err != nil {
+				return fmt.Errorf("encrypt source payload: %w", err)
+			}
+			p.Content = ""
+			p.Source = ""
+			p.ContentCiphertext = contentCiphertext
+			p.SourceCiphertext = sourceCiphertext
+		}
+		payload, err := json.Marshal(p)
 		if err != nil {
 			return fmt.Errorf("marshal payload: %w", err)
 		}

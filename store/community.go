@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/sharpner/ultramemory/secureindex"
 	"gonum.org/v1/gonum/graph/community"
 	"gonum.org/v1/gonum/graph/simple"
 )
@@ -263,6 +264,34 @@ func (d *DB) CommunityInputsForGroup(ctx context.Context, groupID string, minMem
 	return inputs, nil
 }
 
+// CommunityInputsForGroupSecure decrypts entity names and edge facts for secure report generation.
+func (d *DB) CommunityInputsForGroupSecure(ctx context.Context, groupID string, minMembers int, personalKey string) ([]CommunityInput, error) {
+	inputs, err := d.CommunityInputsForGroup(ctx, groupID, minMembers)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range inputs {
+		for j := range inputs[i].EntityNames {
+			name, err := secureindex.DecryptString(personalKey, "entity-name", inputs[i].EntityNames[j])
+			if err != nil {
+				inputs[i].EntityNames[j] = "<locked>"
+				continue
+			}
+			inputs[i].EntityNames[j] = name
+		}
+		for j := range inputs[i].KeyFacts {
+			fact, err := secureindex.DecryptString(personalKey, "edge-fact", inputs[i].KeyFacts[j])
+			if err != nil {
+				inputs[i].KeyFacts[j] = "<locked>"
+				continue
+			}
+			inputs[i].KeyFacts[j] = fact
+		}
+	}
+	return inputs, nil
+}
+
 // CommunitySummary holds display data for one community.
 type CommunitySummary struct {
 	CommunityID int      `json:"community_id"`
@@ -318,6 +347,34 @@ func (d *DB) ListCommunities(ctx context.Context, groupID string) ([]CommunitySu
 	return result, nil
 }
 
+// ListSecureCommunities returns communities with encrypted names/reports decrypted for the caller.
+func (d *DB) ListSecureCommunities(ctx context.Context, groupID, personalKey string) ([]CommunitySummary, error) {
+	communities, err := d.ListCommunities(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range communities {
+		for j := range communities[i].Members {
+			name, err := secureindex.DecryptString(personalKey, "entity-name", communities[i].Members[j])
+			if err != nil {
+				communities[i].Members[j] = "<locked>"
+				continue
+			}
+			communities[i].Members[j] = name
+		}
+		if communities[i].Report == "" {
+			continue
+		}
+		report, err := secureindex.DecryptString(personalKey, "community-report", communities[i].Report)
+		if err != nil {
+			communities[i].Report = "<locked>"
+			continue
+		}
+		communities[i].Report = report
+	}
+	return communities, nil
+}
+
 // WriteCommunityIDs writes community assignments to the entities table.
 // communities maps community ID → list of entity UUIDs.
 func (d *DB) WriteCommunityIDs(ctx context.Context, groupID string, communities map[int64][]string) error {
@@ -350,6 +407,15 @@ func (d *DB) StoreCommunityReport(ctx context.Context, groupID string, community
 	_, err := d.sql.ExecContext(ctx,
 		`INSERT OR REPLACE INTO community_reports (community_id, group_id, report) VALUES (?, ?, ?)`,
 		communityID, groupID, report)
+	return err
+}
+
+// ClearCommunityReports removes all stored reports for one group.
+func (d *DB) ClearCommunityReports(ctx context.Context, groupID string) error {
+	_, err := d.sql.ExecContext(ctx,
+		`DELETE FROM community_reports WHERE group_id = ?`,
+		groupID,
+	)
 	return err
 }
 
