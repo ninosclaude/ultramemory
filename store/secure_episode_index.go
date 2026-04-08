@@ -7,18 +7,18 @@ import (
 
 // SecureEpisodeIndexRow stores one keyed episode representation for personal search/clustering.
 type SecureEpisodeIndexRow struct {
-	EpisodeUUID string
-	GroupID     string
-	Method      string
-	Content     string
-	Source      string
-	Public      []float32
-	Base        []float32
-	WaveReal    []float32
-	WaveImag    []float32
-	ModeWeight  []float32
-	ModeEnergy  []float32
-	KeyProbe    []float32
+	EpisodeUUID  string
+	GroupID      string
+	Method       string
+	Content      string
+	Source       string
+	Public       []float32
+	BaseWaveReal []float32
+	BaseWaveImag []float32
+	WaveReal     []float32
+	WaveImag     []float32
+	ModeWeight   []float32
+	ModeEnergy   []float32
 }
 
 // ReplaceSecureEpisodeIndex replaces the keyed episode index for one group/method.
@@ -38,8 +38,8 @@ func (d *DB) ReplaceSecureEpisodeIndex(ctx context.Context, groupID, method stri
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO secure_episode_index (
-			episode_uuid, group_id, method, public_layer, base_vec, wave_real, wave_imag, mode_weight, mode_energy, key_probe
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			episode_uuid, group_id, method, public_layer, base_vec, base_wave_imag, wave_real, wave_imag, mode_weight, mode_energy, key_probe
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -52,12 +52,13 @@ func (d *DB) ReplaceSecureEpisodeIndex(ctx context.Context, groupID, method stri
 			groupID,
 			method,
 			EncodeEmbedding(row.Public),
-			EncodeEmbedding(row.Base),
+			EncodeEmbedding(row.BaseWaveReal),
+			EncodeEmbedding(row.BaseWaveImag),
 			EncodeEmbedding(row.WaveReal),
 			EncodeEmbedding(row.WaveImag),
 			EncodeEmbedding(row.ModeWeight),
 			EncodeEmbedding(row.ModeEnergy),
-			EncodeEmbedding(row.KeyProbe),
+			EncodeEmbedding(nil),
 		)
 		if err != nil {
 			return fmt.Errorf("insert secure index row %s: %w", row.EpisodeUUID, err)
@@ -76,11 +77,11 @@ func (d *DB) AllSecureEpisodes(ctx context.Context, groupID, method string) ([]S
 			e.source,
 			s.public_layer,
 			s.base_vec,
+			s.base_wave_imag,
 			s.wave_real,
 			s.wave_imag,
 			s.mode_weight,
-			s.mode_energy,
-			s.key_probe
+			s.mode_energy
 		FROM secure_episode_index s
 		JOIN episodes e ON e.uuid = s.episode_uuid
 		WHERE s.group_id = ? AND s.method = ?
@@ -95,35 +96,35 @@ func (d *DB) AllSecureEpisodes(ctx context.Context, groupID, method string) ([]S
 	for rows.Next() {
 		var row SecureEpisodeIndexRow
 		var publicBlob []byte
-		var baseBlob []byte
+		var baseRealBlob []byte
+		var baseImagBlob []byte
 		var waveRealBlob []byte
 		var waveImagBlob []byte
 		var modeWeightBlob []byte
 		var modeEnergyBlob []byte
-		var keyProbeBlob []byte
 		if err := rows.Scan(
 			&row.EpisodeUUID,
 			&row.Content,
 			&row.Source,
 			&publicBlob,
-			&baseBlob,
+			&baseRealBlob,
+			&baseImagBlob,
 			&waveRealBlob,
 			&waveImagBlob,
 			&modeWeightBlob,
 			&modeEnergyBlob,
-			&keyProbeBlob,
 		); err != nil {
 			return nil, err
 		}
 		row.GroupID = groupID
 		row.Method = method
 		row.Public = DecodeEmbedding(publicBlob)
-		row.Base = DecodeEmbedding(baseBlob)
+		row.BaseWaveReal = DecodeEmbedding(baseRealBlob)
+		row.BaseWaveImag = DecodeEmbedding(baseImagBlob)
 		row.WaveReal = DecodeEmbedding(waveRealBlob)
 		row.WaveImag = DecodeEmbedding(waveImagBlob)
 		row.ModeWeight = DecodeEmbedding(modeWeightBlob)
 		row.ModeEnergy = DecodeEmbedding(modeEnergyBlob)
-		row.KeyProbe = DecodeEmbedding(keyProbeBlob)
 		out = append(out, row)
 	}
 	return out, rows.Err()

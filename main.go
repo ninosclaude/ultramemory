@@ -44,7 +44,7 @@ const (
 	defaultDB    = "memory-local.db"
 	defaultGroup = "default"
 	pollInterval = 200 * time.Millisecond
-	secureMethod = "bregman-v1"
+	secureMethod = "kpt-v1"
 )
 
 func main() {
@@ -176,16 +176,16 @@ func main() {
 		for _, episode := range episodes {
 			state := method.EncodeDoc(episode.Embedding)
 			rows = append(rows, store.SecureEpisodeIndexRow{
-				EpisodeUUID: episode.UUID,
-				GroupID:     groupID,
-				Method:      *methodName,
-				Public:      state.Public,
-				Base:        state.Base,
-				WaveReal:    state.WaveReal,
-				WaveImag:    state.WaveImag,
-				ModeWeight:  state.ModeWeight,
-				ModeEnergy:  state.ModeEnergy,
-				KeyProbe:    state.KeyProbe,
+				EpisodeUUID:  episode.UUID,
+				GroupID:      groupID,
+				Method:       *methodName,
+				Public:       state.Public,
+				BaseWaveReal: state.BaseWaveReal,
+				BaseWaveImag: state.BaseWaveImag,
+				WaveReal:     state.WaveReal,
+				WaveImag:     state.WaveImag,
+				ModeWeight:   state.ModeWeight,
+				ModeEnergy:   state.ModeEnergy,
 			})
 		}
 		must(db.ReplaceSecureEpisodeIndex(ctx, groupID, *methodName, rows), "store secure index")
@@ -239,7 +239,7 @@ func main() {
 		if len(rows) == 0 {
 			fatalf("no secure episode index found for group %q and method %q; run ultramemory personal-index first", groupID, *methodName)
 		}
-		method := secureindex.NewMethod(secureKey, len(rows[0].Base))
+		method := secureindex.NewMethod(secureKey, len(rows[0].BaseWaveReal))
 		clusters := method.Cluster(secureStates(rows), *k, *resolution, *minScore)
 		printPersonalClusters(rows, clusters, *format, *minMembers)
 
@@ -743,9 +743,9 @@ func usage() {
   ingest  <path>   queue all text files for processing         [-source URL]
   worker           process queued jobs (blocking)
   search  <query>  hybrid search over the graph (flags: -format text|json, -max-tokens N)
-  personal-index   build keyed episode index from existing episode embeddings (-key, -method)
-  personal-search  keyed search over episodes                                 (-key, -method, -limit, -format)
-  personal-cluster keyed clustering over episode semantics                    (-key, -method, -k, -min-score)
+  personal-index   build keyed KPT episode index from existing embeddings     (-key, -method)
+  personal-search  keyed KPT search over episodes                             (-key, -method, -limit, -format)
+  personal-cluster keyed KPT clustering over episode semantics                (-key, -method, -k, -min-score)
   retry            requeue all failed jobs for reprocessing
   resolve          merge near-duplicate entities (flags: -dry-run, -threshold 0.85)
   communities      detect + list communities                     (flags: -detect, -ricci, -format, -resolution)
@@ -794,13 +794,13 @@ func secureStates(rows []store.SecureEpisodeIndexRow) []secureindex.State {
 	states := make([]secureindex.State, 0, len(rows))
 	for _, row := range rows {
 		states = append(states, secureindex.State{
-			Public:     row.Public,
-			Base:       row.Base,
-			WaveReal:   row.WaveReal,
-			WaveImag:   row.WaveImag,
-			ModeWeight: row.ModeWeight,
-			ModeEnergy: row.ModeEnergy,
-			KeyProbe:   row.KeyProbe,
+			Public:       row.Public,
+			BaseWaveReal: row.BaseWaveReal,
+			BaseWaveImag: row.BaseWaveImag,
+			WaveReal:     row.WaveReal,
+			WaveImag:     row.WaveImag,
+			ModeWeight:   row.ModeWeight,
+			ModeEnergy:   row.ModeEnergy,
 		})
 	}
 	return states

@@ -131,11 +131,12 @@ CREATE TABLE IF NOT EXISTS secure_episode_index (
 	method        TEXT NOT NULL,
 	public_layer  BLOB NOT NULL,
 	base_vec      BLOB NOT NULL,
+	base_wave_imag BLOB NOT NULL,
 	wave_real     BLOB NOT NULL,
 	wave_imag     BLOB NOT NULL,
 	mode_weight   BLOB NOT NULL,
 	mode_energy   BLOB NOT NULL,
-	key_probe     BLOB NOT NULL,
+	key_probe     BLOB,
 	created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY (episode_uuid, group_id, method),
 	FOREIGN KEY (episode_uuid) REFERENCES episodes(uuid)
@@ -172,15 +173,17 @@ CREATE TABLE IF NOT EXISTS secure_episode_index (
 	method        TEXT NOT NULL,
 	public_layer  BLOB NOT NULL,
 	base_vec      BLOB NOT NULL,
+	base_wave_imag BLOB NOT NULL DEFAULT X'',
 	wave_real     BLOB NOT NULL,
 	wave_imag     BLOB NOT NULL,
 	mode_weight   BLOB NOT NULL,
 	mode_energy   BLOB NOT NULL,
-	key_probe     BLOB NOT NULL,
+	key_probe     BLOB,
 	created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY (episode_uuid, group_id, method)
 );
 CREATE INDEX IF NOT EXISTS idx_secure_episode_index_group ON secure_episode_index(group_id, method);
+ALTER TABLE secure_episode_index ADD COLUMN base_wave_imag BLOB NOT NULL DEFAULT X'';
 ALTER TABLE secure_episode_index ADD COLUMN key_probe BLOB;
 `
 

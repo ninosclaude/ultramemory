@@ -207,11 +207,11 @@ ultramemory status -format json
 3. **Embed**: the active embedding backend generates vectors for semantic search
 4. **Search**: Hybrid FTS5 + cosine similarity fused via RRF, then extended by MAGMA graph traversal
 
-### Experimental personal secure index
+### Experimental personal KPT index
 
-The repository now also includes an experimental keyed episode layer for personal memory workflows:
+The repository now also includes an experimental KPT-backed keyed episode layer for personal memory workflows:
 
-- `personal-index` builds a `bregman-v1` secure episode index from existing episode embeddings
+- `personal-index` builds a `kpt-v1` secure episode index from existing episode embeddings
 - `personal-search` scores queries directly in the keyed semantic space
 - `personal-cluster` builds communities over keyed episode similarity rather than the extracted entity graph
 
